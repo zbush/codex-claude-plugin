@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -7,7 +8,11 @@ import { readOptions, routes } from './settings.mjs';
 const options = readOptions(process.argv.slice(2), { allowConfigFile: false });
 options.workspace ??= process.cwd();
 const route = routes[options.direction];
-const server = new McpServer({ name: options.direction, version: '1.0.0' });
+const icon = readFileSync(new URL('./assets/icon-64.png', import.meta.url), 'base64');
+const server = new McpServer({
+  name: options.direction, version: '1.0.0',
+  icons: [{ src: 'data:image/png;base64,' + icon, mimeType: 'image/png', sizes: ['64x64'] }],
+});
 const shutdown = new AbortController();
 
 server.registerTool('delegate', {
