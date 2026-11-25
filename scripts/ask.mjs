@@ -10,7 +10,8 @@ const options = readOptions(args);
 const task = readFileSync(0, 'utf8').trim();
 if (!task) throw new Error('Pipe a task to stdin.');
 const client = new Client({ name: 'delegation-smoke-test', version: '1.0.0' });
-const transport = new StdioClientTransport({ command: process.execPath, args: [bridgePath, ...serverArgs(options)] });
+const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith('AGENT_BRIDGE_')));
+const transport = new StdioClientTransport({ command: process.execPath, args: [bridgePath, ...serverArgs(options)], env });
 try {
   await client.connect(transport);
   const result = await client.callTool({ name: 'delegate', arguments: { task } }, undefined, {

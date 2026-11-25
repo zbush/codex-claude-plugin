@@ -43,7 +43,7 @@ A hop is one handoff. At one hop, each delegated session runs as a leaf. When an
 
 The host can forward `AGENT_BRIDGE_CONTEXT` when a call has already crossed another bridge. Its version 1 JSON object contains ordered `{from, to, id}` hops and `remaining_hops`. The bridge respects the smaller of that budget and this registration's `--hops`, adds the current handoff, and gives each explicitly configured callback its own copy. A zero budget refuses the call. The tool's optional `context` string is task background supplied by the caller.
 
-For a Codex registration used across plugins, include `"AGENT_BRIDGE_CONTEXT"` and `"AGENT_BRIDGE_DEPTH"` in the `env_vars` list under `[mcp_servers.claude_delegate]`. Restart the host after modifying the registration. The bridge supplies its own recursive callbacks with the context automatically.
+For a Codex registration used across plugins, add `AGENT_BRIDGE_CONTEXT`, `AGENT_BRIDGE_DEPTH`, `AGENT_BRIDGE_WORKSPACE_ROOTS`, and `AGENT_BRIDGE_ALLOW_EDITS` to `env_vars` under `[mcp_servers.claude_delegate]`, then restart the host. The bridge passes `AGENT_BRIDGE_CONTEXT` to its own recursive callbacks automatically. When the host forwards workspace roots or edit permissions, the bridge checks the registered workspace against those roots and passes that workspace and the recipient's effective edit permission to its callbacks.
 
 ### Recipient settings
 

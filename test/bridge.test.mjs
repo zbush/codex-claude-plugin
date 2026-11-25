@@ -15,7 +15,7 @@ const executable = fileURLToPath(new URL('../fixtures/recipient.cjs', import.met
 const task = 'Review "this" & check %PATH% | $SHELL\nInclude café and 雪.';
 const context = 'Relayed by another agent.\nThe human may not have read this.';
 
-async function connect(t, direction, hops, extra = {}, bridgeContext) {
+async function connect(t, direction, hops, extra = {}, bridgeContext, env = {}) {
   const workspace = await mkdtemp(join(tmpdir(), 'bridge test '));
   t.after(() => rm(workspace, { recursive: true, force: true }));
   const config = join(workspace, 'settings with spaces.json');
@@ -23,7 +23,7 @@ async function connect(t, direction, hops, extra = {}, bridgeContext) {
   const client = new Client({ name: 'test', version: '1' });
   const options = readOptions([direction, '--config', config, '--workspace', workspace, '--hops', String(hops)]);
   const args = [bridgePath, ...serverArgs({ ...options, bridgeContext })];
-  await client.connect(new StdioClientTransport({ command: process.execPath, args }));
+  await client.connect(new StdioClientTransport({ command: process.execPath, args, env }));
   t.after(() => client.close());
   const call = (taskText = task) => client.callTool({ name: 'delegate', arguments: { task: taskText, context } });
   return { client, call, config, workspace };
@@ -93,6 +93,55 @@ test('a foreign hop limits a real MCP call and its recipient environment', async
   assert.ok(!record.args.includes('--mcp-config'));
   const leaf = await connect(t, 'to-codex', 8, {}, record.bridgeContext);
   assert.match((await leaf.call()).content[0].text, /hop budget exhausted/);
+});
+
+test('forwarded workspace and edit limits narrow the registered peer settings', async t => {
+  const requested = { claude: { executable, allowEdits: true }, codex: { executable, allowEdits: true } };
+  const host = { AGENT_BRIDGE_WORKSPACE_ROOTS: JSON.stringify([tmpdir()]), AGENT_BRIDGE_ALLOW_EDITS: 'false' };
+  const { call, workspace } = await connect(t, 'to-claude', 2, requested, undefined, host);
+  const result = await call();
+  assert.ok(!result.isError, result.content[0].text);
+  const { args, roots, edits } = JSON.parse(result.content[0].text.split('\n\n')[1]);
+  assert.equal(roots, JSON.stringify([realpathSync.native(workspace)]));
+  assert.equal(edits, 'false');
+  assert.equal(args[args.indexOf('--tools') + 1], 'Read,Glob,Grep');
+  const peer = JSON.parse(args[args.indexOf('--mcp-config') + 1]).mcpServers.codex_delegate;
+  assert.equal(readOptions(peer.args.slice(1)).settings.codex.allowEdits, false);
+  assert.deepEqual(peer.env, { AGENT_BRIDGE_WORKSPACE_ROOTS: roots, AGENT_BRIDGE_ALLOW_EDITS: 'false' });
+  const outside = await connect(t, 'to-codex', 1, requested, undefined, { ...host, AGENT_BRIDGE_WORKSPACE_ROOTS: JSON.stringify([process.cwd()]) });
+  assert.match((await outside.call()).content[0].text, /outside the workspace roots/);
+});
+
+test('legacy depth alone cannot reset a budget and either legacy chain can accompany v1', async t => {
+  const incomplete = await connect(t, 'to-claude', 3, {}, undefined, { AGENT_BRIDGE_DEPTH: '1' });
+  const rejected = await incomplete.call();
+  assert.ok(rejected.isError);
+  assert.match(rejected.content[0].text, /requires AGENT_BRIDGE_CONTEXT/);
+  const ctx = { version: 1, hops: [{ from: 'antigravity', to: 'codex', id: 'one' }], remaining_hops: 1 };
+  for (const chain of ['antigravity:one', '["antigravity_to_codex"]']) {
+    const host = { AGENT_BRIDGE_CONTEXT: JSON.stringify(ctx), AGENT_BRIDGE_DEPTH: '1', AGENT_BRIDGE_CHAIN: chain };
+    const client = await connect(t, 'to-claude', 3, {}, undefined, host);
+    const result = await client.call();
+    assert.ok(!result.isError, result.content[0].text);
+    const { bridgeContext } = JSON.parse(result.content[0].text.split('\n\n')[1]);
+    assert.deepEqual(bridgeContext.hops[0], ctx.hops[0]);
+    assert.equal(bridgeContext.remaining_hops, 0);
+  }
+});
+
+test('a read-only Codex hop pins its narrowed host ceiling into the callback', async t => {
+  const host = { AGENT_BRIDGE_WORKSPACE_ROOTS: JSON.stringify([tmpdir()]), AGENT_BRIDGE_ALLOW_EDITS: 'true' };
+  const { call, workspace } = await connect(t, 'to-codex', 2, { claude: { executable, allowEdits: true } }, undefined, host);
+  const result = await call();
+  assert.ok(!result.isError, result.content[0].text);
+  const { args, roots, edits } = JSON.parse(result.content[0].text.split('\n\n')[1]);
+  assert.equal(edits, 'false');
+  assert.equal(roots, JSON.stringify([realpathSync.native(workspace)]));
+  const key = 'mcp_servers.claude_delegate';
+  assert.ok(args.includes(key + '.env.AGENT_BRIDGE_WORKSPACE_ROOTS=' + JSON.stringify(roots)));
+  assert.ok(args.includes(key + '.env.AGENT_BRIDGE_ALLOW_EDITS="false"'));
+  const registered = JSON.parse(args.find(s => s.startsWith(key + '.args=')).slice((key + '.args=').length));
+  assert.equal(readOptions(registered.slice(1)).settings.claude.allowEdits, false);
 });
 
 test('Codex peer receives a bounded reverse route and independent recipient settings', async t => {

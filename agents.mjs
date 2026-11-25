@@ -4,16 +4,18 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { routes, serverArgs } from './settings.mjs';
 import { nextContext, readContext } from './context.mjs';
+import { EDITS_ENV, ROOTS_ENV, loadWorkspacePolicy, resolveWorkspaceDir } from './workspace-policy.mjs';
 import { launcher, runAgent } from './run.mjs';
 
 export const bridgePath = fileURLToPath(new URL('./bridge.mjs', import.meta.url));
 
-function reciprocalServer(options, childContext) {
+function reciprocalServer(options, childContext, env) {
   if (!childContext.remaining_hops) return;
   const direction = routes[options.direction].reverse;
   return {
     command: process.execPath,
     args: [bridgePath, ...serverArgs({ ...options, direction, hops: childContext.remaining_hops, bridgeContext: childContext })],
+    ...(env[ROOTS_ENV] !== undefined && { env: { [ROOTS_ENV]: env[ROOTS_ENV], [EDITS_ENV]: env[EDITS_ENV] } }),
   };
 }
 
@@ -31,7 +33,7 @@ async function askClaude(options, prompt, signal, childContext, env) {
   const { settings, workspace } = options;
   const config = settings.claude;
   const tools = config.allowEdits ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
-  const peer = reciprocalServer(options, childContext);
+  const peer = reciprocalServer(options, childContext, env);
   const allowed = peer ? tools + ',mcp__codex_delegate__delegate' : tools;
   const args = ['-p', '--restricted', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config',
     '--permission-mode', 'dontAsk', '--tools', tools, '--allowedTools', allowed];
@@ -59,7 +61,7 @@ async function askCodex(options, prompt, signal, childContext, env) {
     if (process.platform === 'win32' && config.windowsSandbox) {
       args.push('-c', `windows.sandbox=${JSON.stringify(config.windowsSandbox)}`);
     }
-    const peer = reciprocalServer(options, childContext);
+    const peer = reciprocalServer(options, childContext, env);
     if (peer) {
       const key = 'mcp_servers.claude_delegate';
       args.push('-c', `${key}.command=${JSON.stringify(peer.command)}`,
@@ -67,6 +69,9 @@ async function askCodex(options, prompt, signal, childContext, env) {
         '-c', `${key}.tool_timeout_sec=${settings.timeoutSeconds}`,
         '-c', `${key}.tools.delegate.approval_mode="approve"`,
         '-c', `${key}.required=true`);
+      for (const [name, value] of Object.entries(peer.env ?? {})) {
+        args.push('-c', `${key}.env.${name}=${JSON.stringify(value)}`);
+      }
     }
     if (config.model) args.push('--model', config.model);
     args.push('-');
@@ -85,23 +90,40 @@ async function askCodex(options, prompt, signal, childContext, env) {
 }
 
 export async function delegate(options, { task, context }, signal) {
+  // A host forwarding its own launch ceiling can only narrow the stored registration.
   const route = routes[options.direction];
+  const hasHostCeiling = process.env[ROOTS_ENV] !== undefined || process.env[EDITS_ENV] !== undefined;
+  if (hasHostCeiling) {
+    const ceiling = loadWorkspacePolicy({ cwd: options.workspace });
+    const allowEdits = ceiling.allowEdits && options.settings[route.agent].allowEdits;
+    const settings = { ...options.settings };
+    for (const agent of ['codex', 'claude']) {
+      settings[agent] = { ...settings[agent], allowEdits: settings[agent].allowEdits && allowEdits };
+    }
+    options = { ...options, settings, workspace: resolveWorkspaceDir(ceiling, options.workspace) };
+  }
   const from = route.agent === 'claude' ? 'codex' : 'claude';
   const inherited = readContext(process.env.AGENT_BRIDGE_CONTEXT, from);
   if (inherited && options.bridgeContext && JSON.stringify(inherited) !== JSON.stringify(options.bridgeContext)) {
     throw new Error('The registered callback context differs from the inherited context.');
   }
   const prior = options.bridgeContext ?? inherited;
-  if (!prior && process.env.AGENT_BRIDGE_CHAIN && process.env.AGENT_BRIDGE_CHAIN !== '[]') {
+  const depth = process.env.AGENT_BRIDGE_DEPTH;
+  const chain = process.env.AGENT_BRIDGE_CHAIN;
+  if (!prior && ((depth !== undefined && depth !== '0') || (chain && chain !== '[]'))) {
     throw new Error('Nested delegation requires AGENT_BRIDGE_CONTEXT. Update the host registration to forward it.');
   }
-  if (process.env.AGENT_BRIDGE_DEPTH !== undefined && process.env.AGENT_BRIDGE_DEPTH !== String(prior?.hops.length ?? 0)) {
+  if (depth !== undefined && depth !== String(prior?.hops.length ?? 0)) {
     throw new Error('Delegation depth disagrees with AGENT_BRIDGE_CONTEXT. Update the host registration to forward the context.');
   }
   const childContext = nextContext(prior, from, route.agent, options.hops);
   const env = { ...process.env, AGENT_BRIDGE_CONTEXT: JSON.stringify(childContext),
     AGENT_BRIDGE_DEPTH: String(childContext.hops.length),
     AGENT_BRIDGE_CHAIN: JSON.stringify(childContext.hops.map(hop => hop.from + '_to_' + hop.to)) };
+  if (hasHostCeiling) {
+    env[ROOTS_ENV] = JSON.stringify([options.workspace]);
+    env[EDITS_ENV] = String(options.settings[route.agent].allowEdits);
+  }
   const prompt = delegationPrompt(route, task, context);
   const ask = route.agent === 'claude' ? askClaude : askCodex;
   const answer = await ask(options, prompt, signal, childContext, env);
