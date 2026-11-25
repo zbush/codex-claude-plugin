@@ -15,14 +15,14 @@ const executable = fileURLToPath(new URL('../fixtures/recipient.cjs', import.met
 const task = 'Review "this" & check %PATH% | $SHELL\nInclude café and 雪.';
 const context = 'Relayed by another agent.\nThe human may not have read this.';
 
-async function connect(t, direction, hops, extra = {}) {
+async function connect(t, direction, hops, extra = {}, bridgeContext) {
   const workspace = await mkdtemp(join(tmpdir(), 'bridge test '));
   t.after(() => rm(workspace, { recursive: true, force: true }));
   const config = join(workspace, 'settings with spaces.json');
   await writeFile(config, JSON.stringify({ codex: { executable }, claude: { executable }, ...extra }));
   const client = new Client({ name: 'test', version: '1' });
   const options = readOptions([direction, '--config', config, '--workspace', workspace, '--hops', String(hops)]);
-  const args = [bridgePath, ...serverArgs(options)];
+  const args = [bridgePath, ...serverArgs({ ...options, bridgeContext })];
   await client.connect(new StdioClientTransport({ command: process.execPath, args }));
   t.after(() => client.close());
   const call = (taskText = task) => client.callTool({ name: 'delegate', arguments: { task: taskText, context } });
@@ -74,9 +74,25 @@ test('Claude peer receives the reverse route with one less hop and the same sett
   assert.equal(nested.direction, 'to-codex');
   assert.equal(nested.workspace, workspace);
   assert.equal(nested.hops, 2);
+  assert.equal(nested.bridgeContext.remaining_hops, 2);
+  assert.equal(nested.bridgeContext.hops[0].from, 'codex');
   assert.deepEqual(nested.settings.claude, { executable, allowEdits: true });
   assert.ok(args[args.indexOf('--allowedTools') + 1].includes('mcp__codex_delegate__delegate'));
   assert.ok(args[args.indexOf('--tools') + 1].includes('Edit'));
+});
+
+test('a foreign hop limits a real MCP call and its recipient environment', async t => {
+  const incoming = { version: 1, hops: [{ from: 'antigravity', to: 'codex', id: 'foreign' }], remaining_hops: 1 };
+  const { call } = await connect(t, 'to-claude', 8, {}, incoming);
+  const result = await call();
+  assert.ok(!result.isError, result.content[0].text);
+  const record = JSON.parse(result.content[0].text.split('\n\n')[1]);
+  assert.equal(record.bridgeContext.remaining_hops, 0);
+  assert.deepEqual(record.bridgeContext.hops[0], incoming.hops[0]);
+  assert.equal(record.bridgeContext.hops[1].to, 'claude');
+  assert.ok(!record.args.includes('--mcp-config'));
+  const leaf = await connect(t, 'to-codex', 8, {}, record.bridgeContext);
+  assert.match((await leaf.call()).content[0].text, /hop budget exhausted/);
 });
 
 test('Codex peer receives a bounded reverse route and independent recipient settings', async t => {

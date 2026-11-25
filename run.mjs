@@ -47,12 +47,12 @@ function stopTree(child) {
   }
 }
 
-export function runAgent(command, args, { cwd, input, signal, collectOutput = true }) {
+export function runAgent(command, args, { cwd, input, signal, collectOutput = true, env }) {
   signal.throwIfAborted();
   return new Promise((resolve, reject) => {
     const [program, ...prefix] = command;
     const child = spawn(program, [...prefix, ...args], {
-      cwd, stdio: ['pipe', collectOutput ? 'pipe' : 'ignore', 'pipe'],
+      cwd, env, stdio: ['pipe', collectOutput ? 'pipe' : 'ignore', 'pipe'],
       shell: false, windowsHide: true, detached: process.platform !== 'win32',
     });
     const stdout = [];

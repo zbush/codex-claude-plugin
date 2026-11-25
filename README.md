@@ -41,6 +41,10 @@ node scripts/register.mjs to-codex --hops 4
 
 A hop is one handoff. At one hop, each delegated session runs as a leaf. When another hop remains, the bridge attaches an explicit per-call reciprocal MCP configuration for that session. With two hops, Codex can ask Claude, Claude can consult a fresh Codex session, and both replies return to the original caller. With four, the chain can go two handoffs further. Each top-level call gets a fresh allowance. Set the two registrations independently if one host should be able to initiate longer chains. The initiating registration passes its validated settings snapshot and remaining hops to each nested server.
 
+The host can forward `AGENT_BRIDGE_CONTEXT` when a call has already crossed another bridge. Its version 1 JSON object contains ordered `{from, to, id}` hops and `remaining_hops`. The bridge respects the smaller of that budget and this registration's `--hops`, adds the current handoff, and gives each explicitly configured callback its own copy. A zero budget refuses the call. The tool's optional `context` string is task background supplied by the caller.
+
+For a Codex registration used across plugins, include `"AGENT_BRIDGE_CONTEXT"` and `"AGENT_BRIDGE_DEPTH"` in the `env_vars` list under `[mcp_servers.claude_delegate]`. Restart the host after modifying the registration. The bridge supplies its own recursive callbacks with the context automatically.
+
 ### Recipient settings
 
 To select models, executables or edit permissions, create a private JSON file such as `.local/bridge.json`. Create the `.local` directory first. For example, this configuration allows delegated Codex sessions to edit and keeps delegated Claude sessions read-only.

@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { z } from 'zod';
+import { readContext } from './context.mjs';
 
 const recipient = z.object({
   executable: z.string().min(1).optional(),
@@ -25,7 +26,7 @@ export const routes = {
 export function readOptions(argv, { allowConfigFile = true } = {}) {
   const { positionals, values } = parseArgs({
     args: argv, allowPositionals: true,
-    options: { config: { type: 'string' }, 'settings-json': { type: 'string' },
+    options: { config: { type: 'string' }, 'settings-json': { type: 'string' }, 'bridge-context': { type: 'string' },
       workspace: { type: 'string' }, hops: { type: 'string', default: '1' } },
   });
   const [direction] = positionals;
@@ -43,12 +44,14 @@ export function readOptions(argv, { allowConfigFile = true } = {}) {
   }
   const json = values.config === undefined ? values['settings-json'] : readFileSync(resolve(values.config), 'utf8');
   const settings = settingsFile.parse(json === undefined ? {} : JSON.parse(json.replace(/^\uFEFF/, '')));
-  return { direction, workspace: values.workspace && resolve(values.workspace), hops: Number(values.hops), settings };
+  const bridgeContext = readContext(values['bridge-context'], routes[direction].agent === 'claude' ? 'codex' : 'claude');
+  return { direction, workspace: values.workspace && resolve(values.workspace), hops: Number(values.hops), settings, bridgeContext };
 }
 
-export function serverArgs({ direction, settings, workspace, hops }) {
+export function serverArgs({ direction, settings, workspace, hops, bridgeContext }) {
   // Registrations and reciprocal launches use the policy validated by their caller.
   const args = [direction, '--hops', String(hops), '--settings-json', JSON.stringify(settings)];
   if (workspace) args.push('--workspace', workspace);
+  if (bridgeContext) args.push('--bridge-context', JSON.stringify(bridgeContext));
   return args;
 }
