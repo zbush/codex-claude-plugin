@@ -6,7 +6,7 @@ Every task starts with **AGENT-TO-AGENT DELEGATION**, names the immediate sender
 
 ## Install
 
-1. Install Node.js 22 or later and both CLIs. Sign in to each CLI and confirm it can answer a short prompt. The bridge uses those existing sign-ins. The live Windows checks used Codex CLI 0.171.0 and Claude Code 2.1.330. [Codex CLI](https://developers.openai.com/codex/cli/) · [Claude Code setup](https://code.claude.com/docs/en/setup)
+1. Install Node.js 22 or later, Codex CLI, and Claude Code 2.1.248 or later. Sign in to each CLI and confirm it can answer a short prompt. The bridge uses those existing sign-ins. [Codex CLI](https://developers.openai.com/codex/cli/) · [Claude Code setup](https://code.claude.com/docs/en/setup)
 2. Clone this repository using its **Code** menu. Keep the checkout where the hosts can continue to launch it.
 3. From the checkout, install the locked dependencies.
 
@@ -39,7 +39,11 @@ node scripts/register.mjs to-claude --hops 4
 node scripts/register.mjs to-codex --hops 4
 ```
 
-A hop is one handoff. With two hops, Codex can ask Claude, Claude can consult a fresh Codex session, and both replies return to the original caller. With four, the chain can go two handoffs further. Each top-level call gets a fresh allowance. Set the two registrations independently if one host should be able to initiate longer chains. The initiating registration passes its settings and remaining hops to each nested server.
+A hop is one handoff. At one hop, each delegated session runs as a leaf. When another hop remains, the bridge attaches an explicit per-call reciprocal MCP configuration for that session. With two hops, Codex can ask Claude, Claude can consult a fresh Codex session, and both replies return to the original caller. With four, the chain can go two handoffs further. Each top-level call gets a fresh allowance. Set the two registrations independently if one host should be able to initiate longer chains. The initiating registration passes its validated settings snapshot and remaining hops to each nested server.
+
+The host can forward `AGENT_BRIDGE_CONTEXT` when a call has already crossed another bridge. Its version 1 JSON object contains ordered `{from, to, id}` hops and `remaining_hops`. The bridge respects the smaller of that budget and this registration's `--hops`, adds the current handoff, and gives each explicitly configured callback its own copy. A zero budget refuses the call. The tool's optional `context` string is task background supplied by the caller.
+
+For a Codex registration used across plugins, add `AGENT_BRIDGE_CONTEXT`, `AGENT_BRIDGE_DEPTH`, `AGENT_BRIDGE_WORKSPACE_ROOTS`, and `AGENT_BRIDGE_ALLOW_EDITS` to `env_vars` under `[mcp_servers.claude_delegate]`, then restart the host. The bridge passes `AGENT_BRIDGE_CONTEXT` to its own recursive callbacks automatically. When the host forwards workspace roots or edit permissions, the bridge checks the registered workspace against those roots and passes that workspace and the recipient's effective edit permission to its callbacks.
 
 ### Recipient settings
 
@@ -53,21 +57,23 @@ To select models, executables or edit permissions, create a private JSON file su
 }
 ```
 
-Pass the file to each registration that should use it. Separate files let the two initiating hosts use different policies.
+A settings file is the operator input to `register.mjs` or `ask.mjs`. Registration validates the file and stores a snapshot of those settings in the host configuration, and nested peers carry that validated snapshot. Servers started with the legacy `--config` flag refuse to start before reading the file. After editing settings or upgrading a legacy `--config` registration, remove and register the affected direction again, then restart the host. Keep both the installation and any configured executable outside directories delegated workers can edit.
+
+Delegated Claude sessions require a CLI with `--restricted` support (2.1.248 or newer). They use managed settings and the tools explicitly selected by the bridge.
 
 ```sh
 node scripts/register.mjs to-claude --config .local/bridge.json --hops 4
 node scripts/register.mjs to-codex --config .local/bridge.json --hops 4
 ```
 
-- **Executable.** The bridge looks for `claude` and `codex` on PATH. If a desktop host cannot find a CLI, set that recipient’s `executable` to the absolute path to its native binary or JavaScript entry point in your private file. On Windows, use the executable or package entry point instead of a shell shim. If you select a versioned binary bundled with a desktop app, update the private setting when that binary moves.
+- **Executable.** The bridge looks for `claude` and `codex` on PATH. On Windows, PATH lookup resolves a native executable or JavaScript entry point in a fully qualified PATH directory, including quoted paths with spaces. If a desktop host cannot find a CLI, or if a shim-only install exposes only a shell shim on PATH, set that recipient’s `executable` in your settings file to the absolute path to the underlying executable or JavaScript entry point. If you select a versioned binary bundled with a desktop app, update the setting and re-register when that binary moves.
 - **Model.** Set `model` under `claude` or `codex` to a model accepted by that CLI and account. Omitting it selects the CLI’s default for the delegated invocation.
-- **Permissions.** Both recipients default to read-only work. Claude receives Read, Glob and Grep. Enabling its edits adds Edit and Write. Codex runs with its read-only sandbox or, with edits enabled, its workspace-write sandbox. The tool caller cannot change these settings. The entry that initiates a peer chain governs both recipients’ settings for that chain.
+- **Permissions.** Both recipients default to read-only work. Claude receives Read, Glob and Grep, plus the configured reciprocal Codex MCP tool when another hop remains. Enabling its edits adds Edit and Write. Codex runs with its read-only sandbox or, with edits enabled, its workspace-write sandbox. The tool caller cannot change these settings. The entry that initiates a peer chain governs both recipients’ settings for that chain.
 - **Windows sandbox.** If Codex needs a configured Windows sandbox backend for file access, set `codex.windowsSandbox` in the private JSON to the backend provisioned for your machine (`mxc`, `elevated`, or `unelevated`). This selects the implementation of the read-only or workspace-write sandbox. [Codex on Windows](https://developers.openai.com/codex/windows/)
 - **Workspace.** By default a recipient starts in the working directory the host gives its MCP server. To pin a project, append `--workspace` followed by the project directory to the registration command. Quote paths containing spaces. Nested peers use the same directory. The tool description shows the effective directory.
-- **Timeout.** `timeoutSeconds` defaults to 300 seconds per call, including time spent waiting on a peer. Codex’s own tool timeout defaults to 60 seconds. For five-minute calls, add `tool_timeout_sec = 330` inside the existing `[mcp_servers.claude_delegate]` section of your user `config.toml`. In Claude Code, a server’s `timeout` setting is in milliseconds. [Codex MCP configuration](https://developers.openai.com/codex/mcp/) · [Claude Code MCP time limits](https://code.claude.com/docs/en/mcp#time-limits-on-mcp-tool-calls)
+- **Timeout.** `timeoutSeconds` defaults to 300 seconds per call, including time spent waiting on a peer. A cancelled or timed-out call returns an error and can report unconfirmed termination if the bridge cannot observe the CLI process exiting. Codex’s own tool timeout defaults to 60 seconds. For five-minute calls, add `tool_timeout_sec = 330` inside the existing `[mcp_servers.claude_delegate]` section of your user `config.toml`. In Claude Code, a server’s `timeout` setting is in milliseconds. [Codex MCP configuration](https://developers.openai.com/codex/mcp/) · [Claude Code MCP time limits](https://code.claude.com/docs/en/mcp#time-limits-on-mcp-tool-calls)
 
-Delegated Claude sessions use print mode with session persistence disabled. Delegated Codex sessions use ephemeral mode and skip the user configuration file. This keeps the bridge’s reciprocal tool configuration scoped to the current call. Pass any required model selection through the private recipient settings. Each call uses the recipient’s normal account allowance.
+Delegated Claude sessions use print mode with session persistence disabled. Delegated Codex sessions use ephemeral mode and skip the user configuration file, keeping any per-call reciprocal MCP configuration scoped to that call when another hop remains. A recipient CLI that exits successfully may return its complete final message even if descendant processes keep output pipes open. Pass any required model selection through the private recipient settings. Each call uses the recipient’s normal account allowance.
 
 ## Verify and use
 
