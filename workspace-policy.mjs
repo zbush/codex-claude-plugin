@@ -86,7 +86,9 @@ export function resolveWorkspaceDir(policy, p, label = 'cwd') {
   const real = canonicalDir(p);
   if (!real) throw new Error(`'${label}' is not an existing directory: ${p}`);
   if (!policy.roots.some((root) => isWithin(root, real))) {
-    throw new Error(`'${label}' resolves to ${real}, which is outside the workspace roots (${policy.roots.join(', ')}). Set ${ROOTS_ENV} on the host to widen them.`);
+    const error = new Error(`'${label}' resolves to ${real}, which is outside the workspace roots (${policy.roots.join(', ')}). Set ${ROOTS_ENV} on the host to widen them.`);
+    error.code = 'workspace_outside_roots';
+    throw error;
   }
   return real;
 }

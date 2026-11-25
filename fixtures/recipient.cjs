@@ -4,7 +4,8 @@ const args = process.argv.slice(2);
 const input = readFileSync(0, 'utf8');
 const call = JSON.parse(input.trim().split('\n').at(-1));
 const reply = JSON.stringify({ args, input, cwd: process.cwd(), bridgeContext: JSON.parse(process.env.AGENT_BRIDGE_CONTEXT),
-  roots: process.env.AGENT_BRIDGE_WORKSPACE_ROOTS, edits: process.env.AGENT_BRIDGE_ALLOW_EDITS });
+  roots: process.env.AGENT_BRIDGE_WORKSPACE_ROOTS, edits: process.env.AGENT_BRIDGE_ALLOW_EDITS,
+  claudeCode: process.env.CLAUDECODE, entrypoint: process.env.CLAUDE_CODE_ENTRYPOINT });
 if (call.task === 'timeout') {
   setTimeout(() => process.exit(2), 60000);
 } else if (args.includes('exec')) {

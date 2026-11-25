@@ -1,42 +1,67 @@
 import { readFileSync } from 'node:fs';
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { z } from 'zod';
-import { delegate } from './agents.mjs';
-import { readOptions, routes } from './settings.mjs';
+import { AgentExecutionError, delegate, status } from './agents.mjs';
+import { invalidParams, serve } from './mcp.mjs';
+import { hostLimits, readOptions, routes } from './settings.mjs';
 
 const options = readOptions(process.argv.slice(2), { allowConfigFile: false });
 options.workspace ??= process.cwd();
 const route = routes[options.direction];
-const icon = readFileSync(new URL('./assets/icon-64.png', import.meta.url), 'base64');
-const server = new McpServer({
-  name: options.direction, version: '1.0.0',
-  icons: [{ src: 'data:image/png;base64,' + icon, mimeType: 'image/png', sizes: ['64x64'] }],
-});
-const shutdown = new AbortController();
+const serverInfo = { name: route.name, version: '2.0.0' };
+try {
+  const icon = readFileSync(new URL('./assets/icon-64.png', import.meta.url), 'base64');
+  serverInfo.icons = [{ src: 'data:image/png;base64,' + icon, mimeType: 'image/png', sizes: ['64x64'] }];
+} catch { /* The icon is optional in standalone installations. */ }
 
-server.registerTool('delegate', {
-  description: `Delegate a self-contained task from ${route.sender} to a fresh ${route.recipient} session in ${options.workspace}. Context comes from the sending agent. Return its attributed reply.`,
-  inputSchema: {
-    task: z.string().trim().min(1).max(100000).describe('Work to perform and the expected result.'),
-    context: z.string().max(100000).optional().describe('Relevant facts or excerpts to relay to the recipient.'),
+const maxLength = 100_000;
+const tools = [
+  {
+    name: 'delegate',
+    description: 'Delegate a self-contained task from ' + route.sender + ' to a fresh ' + route.recipient +
+      ' session in ' + options.workspace + '. Context comes from the sending agent. Return its attributed reply.',
+    inputSchema: {
+      type: 'object', additionalProperties: false, required: ['task'],
+      properties: {
+        task: { type: 'string', minLength: 1, maxLength, description: 'Work to perform and the expected result.' },
+        context: { type: 'string', maxLength, description: 'Relevant facts or excerpts for the recipient.' },
+      },
+    },
   },
-}, async (input, request) => {
-  const deadline = AbortSignal.timeout(options.settings.timeoutSeconds * 1000);
-  const signal = AbortSignal.any([request.signal, shutdown.signal, deadline]);
+  {
+    name: 'status', description: 'Inspect the bridge configuration, policy and in-flight delegations.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true },
+  },
+];
+
+let activeCalls = 0;
+const { maxConcurrent } = hostLimits(options, process.env);
+async function callTool(name, args, controller) {
+  if (name === 'status') {
+    if (Object.keys(args).length) throw invalidParams('status takes no arguments.');
+    const report = status(options, activeCalls);
+    return { content: [{ type: 'text', text: JSON.stringify(report, null, 2) }], structuredContent: report };
+  }
+  const { task, context } = args;
+  if (Object.keys(args).some(key => key !== 'task' && key !== 'context') ||
+      typeof task !== 'string' || !task.trim() || task.length > maxLength ||
+      (context !== undefined && (typeof context !== 'string' || context.length > maxLength))) {
+    throw invalidParams('delegate requires a non-empty task and accepts optional string context (100000 characters each).');
+  }
+  if (activeCalls >= maxConcurrent) {
+    throw invalidParams('Maximum concurrent delegations reached.', 'max_concurrent_reached');
+  }
+  activeCalls++;
+  const timer = setTimeout(() => controller.abort(), options.settings.timeoutSeconds * 1000);
   try {
-    const text = await delegate(options, input, signal);
+    const text = await delegate(options, { task: task.trim(), context }, controller.signal);
     return { content: [{ type: 'text', text }] };
   } catch (error) {
-    return { isError: true, content: [{ type: 'text', text: `Delegation to ${route.recipient} failed: ${error.message}` }] };
+    if (!(error instanceof AgentExecutionError)) throw error;
+    return { isError: true, content: [{ type: 'text', text: 'Delegation to ' + route.recipient + ' failed: ' + error.message }] };
+  } finally {
+    clearTimeout(timer);
+    activeCalls--;
   }
-});
-
-function close() {
-  shutdown.abort();
-  void server.close();
 }
-process.stdin.once('end', close);
-process.once('SIGINT', close);
-process.once('SIGTERM', close);
-await server.connect(new StdioServerTransport());
+
+serve({ serverInfo, tools, callTool });
