@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { bridgePath } from '../agents.mjs';
-import { readOptions } from '../settings.mjs';
+import { readOptions, serverArgs } from '../settings.mjs';
+import { launcher, runAgent } from '../run.mjs';
 
 const executable = fileURLToPath(new URL('../fixtures/recipient.cjs', import.meta.url));
 const task = 'Review "this" & check %PATH% | $SHELL\nInclude café and 雪.';
@@ -20,7 +21,8 @@ async function connect(t, direction, hops, extra = {}) {
   const config = join(workspace, 'settings with spaces.json');
   await writeFile(config, JSON.stringify({ codex: { executable }, claude: { executable }, ...extra }));
   const client = new Client({ name: 'test', version: '1' });
-  const args = [bridgePath, direction, '--config', config, '--workspace', workspace, '--hops', String(hops)];
+  const options = readOptions([direction, '--config', config, '--workspace', workspace, '--hops', String(hops)]);
+  const args = [bridgePath, ...serverArgs(options)];
   await client.connect(new StdioClientTransport({ command: process.execPath, args }));
   t.after(() => client.close());
   const call = (taskText = task) => client.callTool({ name: 'delegate', arguments: { task: taskText, context } });
@@ -45,6 +47,7 @@ test('Codex-to-Claude leaf labels both sides and skips all configured MCP server
   assert.deepEqual((await client.listTools()).tools.map(x => x.name), ['delegate']);
   const args = inspectReply(await call(), 'Codex', 'Claude Code', workspace);
   assert.ok(args.includes('--strict-mcp-config') && !args.includes('--mcp-config'));
+  assert.ok(args.includes('--restricted'));
   assert.equal(args[args.indexOf('--tools') + 1], 'Read,Glob,Grep');
   assert.ok((await call('failure')).isError);
 });
@@ -62,20 +65,32 @@ test('Claude-to-Codex leaf returns only the final file, rejects partial output, 
 
 test('Claude peer receives the reverse route with one less hop and the same settings', async t => {
   const { call, workspace, config } = await connect(t, 'to-claude', 3, { claude: { executable, allowEdits: true } });
+  // A peer must keep the host's validated policy even when the source goes away.
+  await rm(config);
   const args = inspectReply(await call(), 'Codex', 'Claude Code', workspace);
   const { codex_delegate: peer } = JSON.parse(args[args.indexOf('--mcp-config') + 1]).mcpServers;
-  assert.deepEqual(peer.args, [bridgePath, 'to-codex', '--hops', '2', '--config', config, '--workspace', workspace]);
+  assert.equal(peer.args[0], bridgePath);
+  const nested = readOptions(peer.args.slice(1));
+  assert.equal(nested.direction, 'to-codex');
+  assert.equal(nested.workspace, workspace);
+  assert.equal(nested.hops, 2);
+  assert.deepEqual(nested.settings.claude, { executable, allowEdits: true });
   assert.ok(args[args.indexOf('--allowedTools') + 1].includes('mcp__codex_delegate__delegate'));
   assert.ok(args[args.indexOf('--tools') + 1].includes('Edit'));
 });
 
 test('Codex peer receives a bounded reverse route and independent recipient settings', async t => {
   const codex = { executable, model: 'test-model', allowEdits: true, windowsSandbox: 'elevated' };
-  const { call, workspace, config } = await connect(t, 'to-codex', 2, { codex });
+  const { call, workspace } = await connect(t, 'to-codex', 2, { codex });
   const args = inspectReply(await call(), 'Claude Code', 'Codex', workspace);
   const prefix = 'mcp_servers.claude_delegate.args=';
   const reverse = JSON.parse(args.find(arg => arg.startsWith(prefix)).slice(prefix.length));
-  assert.deepEqual(reverse, [bridgePath, 'to-claude', '--hops', '1', '--config', config, '--workspace', workspace]);
+  assert.equal(reverse[0], bridgePath);
+  const nested = readOptions(reverse.slice(1));
+  assert.equal(nested.direction, 'to-claude');
+  assert.equal(nested.workspace, workspace);
+  assert.equal(nested.hops, 1);
+  assert.deepEqual(nested.settings.codex, codex);
   assert.equal(args[args.indexOf('--sandbox') + 1], 'workspace-write');
   assert.equal(args[args.indexOf('--model') + 1], 'test-model');
   assert.equal(args.includes('windows.sandbox="elevated"'), process.platform === 'win32');
@@ -103,4 +118,50 @@ test('invalid hop counts fail before starting a server', () => {
   for (const hops of ['0', '-1', 'Infinity', '2oops']) {
     assert.throws(() => readOptions(['to-claude', `--hops=${hops}`]), /positive integer/);
   }
+});
+
+test('a finished recipient returns its answer even when a descendant inherits stderr', { timeout: 5000 }, async () => {
+  const parentProgram = `
+    const { spawn } = require('node:child_process');
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 8000)'], {
+      stdio: ['ignore', 'ignore', 2], windowsHide: true,
+    });
+    child.unref();
+    console.log('complete reply');
+  `;
+  const result = await runAgent([process.execPath], ['-e', parentProgram], {
+    input: '', signal: AbortSignal.timeout(2500),
+  });
+  assert.equal(result.code, 0);
+  assert.equal(result.stdout.trim(), 'complete reply');
+});
+
+test('registration snapshots round trip and reject conflicting settings sources', () => {
+  const options = readOptions(['to-claude']);
+  const args = serverArgs(options);
+  assert.deepEqual(readOptions(args), options);
+  assert.throws(() => readOptions([...args, '--config', 'unused']), /one settings source/);
+  assert.throws(() => readOptions(['to-claude', '--config', 'missing'], { allowConfigFile: false }), /Replace it using scripts\/register/);
+});
+
+test('Windows discovery fails when the configured CLI is absent', { skip: process.platform !== 'win32' }, () => {
+  const previousPath = process.env.PATH;
+  try {
+    process.env.PATH = '.';
+    assert.throws(() => launcher('claude'), /absolute executable path/);
+  } finally {
+    process.env.PATH = previousPath;
+  }
+});
+
+test('Windows discovery accepts a quoted PATH directory with spaces', { skip: process.platform !== 'win32' }, async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'quoted bridge bin '));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const cli = join(dir, 'claude.exe');
+  await writeFile(cli, '');
+  const previous = process.env.PATH;
+  try {
+    process.env.PATH = '"' + dir + '"';
+    assert.deepEqual(launcher('claude'), [cli]);
+  } finally { process.env.PATH = previous; }
 });

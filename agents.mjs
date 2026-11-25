@@ -32,7 +32,7 @@ async function askClaude(options, prompt, signal) {
   const tools = config.allowEdits ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
   const peer = reciprocalServer(options);
   const allowed = peer ? tools + ',mcp__codex_delegate__delegate' : tools;
-  const args = ['-p', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config',
+  const args = ['-p', '--restricted', '--output-format', 'json', '--no-session-persistence', '--strict-mcp-config',
     '--permission-mode', 'dontAsk', '--tools', tools, '--allowedTools', allowed];
   if (peer) args.push('--mcp-config', JSON.stringify({ mcpServers: { codex_delegate: peer } }));
   if (config.model) args.push('--model', config.model);
@@ -40,6 +40,7 @@ async function askClaude(options, prompt, signal) {
   let response;
   try { response = JSON.parse(result.stdout); } catch { /* Handle empty or invalid CLI output below. */ }
   if (result.code !== 0 || response?.is_error || !response?.result?.trim()) {
+    if (/unknown option[^\n]*--restricted/i.test(result.stderr)) throw new Error('Restricted delegation requires Claude Code 2.1.248 or newer.');
     throw new Error(`Claude Code failed (exit ${result.code}). ${response?.result || result.stderr.trim() || 'Check Claude Code sign-in and CLI configuration.'}`);
   }
   return response.result;

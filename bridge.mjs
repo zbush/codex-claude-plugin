@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { delegate } from './agents.mjs';
 import { readOptions, routes } from './settings.mjs';
 
-const options = readOptions(process.argv.slice(2));
+const options = readOptions(process.argv.slice(2), { allowConfigFile: false });
 options.workspace ??= process.cwd();
 const route = routes[options.direction];
 const server = new McpServer({ name: options.direction, version: '1.0.0' });

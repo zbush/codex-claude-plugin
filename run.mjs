@@ -1,35 +1,49 @@
 import { spawn } from 'node:child_process';
 import { delimiter, join, isAbsolute } from 'node:path';
-import { existsSync } from 'node:fs';
+import { statSync } from 'node:fs';
 
 // Windows npm distributions may expose only a .cmd shim. Run the official
 // package entry with Node so prompts and arguments never go through cmd.exe.
 export function launcher(agent, override) {
   if (override) {
     if (!isAbsolute(override)) throw new Error('Configure executable as an absolute path.');
-    return /\.[cm]?js$/i.test(override) ? [process.execPath, override] : [override];
+    if (!statSync(override, { throwIfNoEntry: false })?.isFile()) throw new Error('Configured executable does not exist: ' + override);
+    if (/\.[cm]?js$/i.test(override)) return [process.execPath, override];
+    if (process.platform === 'win32' && !/\.exe$/i.test(override)) throw new Error('Configure a Windows .exe or JavaScript CLI entry point.');
+    return [override];
   }
   if (process.platform === 'win32') {
     const entry = agent === 'codex' ? ['@openai', 'codex', 'bin', 'codex.js'] : ['@anthropic-ai', 'claude-code', 'cli.js'];
-    for (const directory of (process.env.PATH ?? '').split(delimiter).filter(isAbsolute)) {
+    const directories = (process.env.PATH ?? '').split(delimiter).map(dir => dir.replace(/^"|"$/g, ''));
+    for (const directory of directories.filter(isAbsolute)) {
       for (const parts of [[agent + '.exe'], ['node_modules', ...entry]]) {
         const candidate = join(directory, ...parts);
-        if (existsSync(candidate)) return parts.length === 1 ? [candidate] : [process.execPath, candidate];
+        if (statSync(candidate, { throwIfNoEntry: false })?.isFile()) return parts.length === 1 ? [candidate] : [process.execPath, candidate];
       }
     }
+    throw new Error('Cannot find ' + agent + '.exe or its npm entry in an absolute PATH directory. Configure its absolute executable path (.exe or JavaScript).');
   }
   return [agent];
 }
 
 function stopTree(child) {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (!child.pid) return;
+  const killChild = () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      try { child.kill('SIGKILL'); } catch { /* Exit and cleanup can race. */ }
+    }
+  };
   if (process.platform === 'win32') {
-    const killer = spawn(join(process.env.SystemRoot, 'System32', 'taskkill.exe'),
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const root = [process.env.SystemRoot, process.env.WINDIR].find(dir => /^[a-z]:[\\/]/i.test(dir ?? ''));
+    if (!root) return killChild();
+    const killer = spawn(join(root, 'System32', 'taskkill.exe'),
       ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, stdio: 'ignore' });
-    killer.on('error', () => child.kill());
-    killer.once('exit', code => { if (code !== 0 && child.exitCode === null) child.kill(); });
+    killer.once('error', killChild);
+    killer.once('exit', code => { if (code !== 0) killChild(); });
+    killer.unref();
   } else {
-    try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') child.kill(); }
+    try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') killChild(); }
   }
 }
 
@@ -45,12 +59,23 @@ export function runAgent(command, args, { cwd, input, signal, collectOutput = tr
     let size = 0;
     let failure;
     let stderr = '';
+    let drainTimer, stopTimer;
+    function closePipes() {
+      child.stdin.destroy();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    }
     function stop(reason) {
       if (failure) return;
       failure = reason;
       stopTree(child);
+      closePipes();
+      stopTimer = setTimeout(() => reject(new Error(reason.message + ' Process termination unconfirmed.')), 5000);
     }
-    const abort = () => stop(new Error('Delegation cancelled or timed out.'));
+    const abort = () => {
+      if (child.exitCode !== null || child.signalCode !== null) closePipes();
+      else stop(new Error('Delegation cancelled or timed out.'));
+    };
     signal.addEventListener('abort', abort, { once: true });
     child.stdout?.on('data', chunk => {
       size += chunk.length;
@@ -60,7 +85,13 @@ export function runAgent(command, args, { cwd, input, signal, collectOutput = tr
     child.stderr.setEncoding('utf8').on('data', chunk => { stderr = (stderr + chunk).slice(-8192); });
     child.stdin.on('error', error => { if (error.code !== 'EPIPE') stop(error); });
     child.on('error', reject);
+    child.once('exit', () => {
+      clearTimeout(stopTimer);
+      drainTimer = setTimeout(closePipes, 500);
+    });
     child.once('close', code => {
+      clearTimeout(stopTimer);
+      clearTimeout(drainTimer);
       signal.removeEventListener('abort', abort);
       if (failure) return reject(failure);
       resolve({ code, stdout: Buffer.concat(stdout).toString('utf8'), stderr });
