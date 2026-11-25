@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Claude pixel robot with a terminal prompt inside a six-loop Codex knot" width="128" height="128" />
+</p>
+
 # Codex ↔ Claude Code
 
 Give Codex a `claude_delegate` MCP tool, give Claude Code a `codex_delegate` tool, or install both. Each call starts a fresh CLI session in the selected workspace and returns the recipient’s final answer to the sending agent.
