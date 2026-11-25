@@ -1,6 +1,7 @@
 {
   "name": "codex-claude-plugin",
   "version": "1.0.0",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "description": "Two local MCP connectors for delegation between Codex and Claude Code",
